@@ -1,240 +1,98 @@
-# 【万字长文】揭秘 Claude Code：从 51 万行源码看大模型终端 Agent 的工程化极限
-
-> **作者按**：本文基于对 Claude Code 官方发出版 `cli.js.map` 逆向还原出的 1900 多个文件、超过 51 万行 TypeScript 源码的逐行走查。这不仅是一篇产品分析，更是一份针对“如何用大语言模型构建高阶生产力 Agent”的深度技术解剖报告。由于包含了大量代码层面的架构拆解与机制分析，全文将详细展开系统的每一个角落，揭开这款被誉为当前最强终端 AI 编程助手的神秘面纱。
 
 ---
 
-## 第一部分：这绝对不是一个 “套壳 API” 的玩具
+## 第六部分：硬核拓展 —— 隐藏在源码中的 Prompt 工程与工具 Schema 哲学
 
-当 Claude 3.7 Sonnet 带着被吹爆的 “Claude Code” 终端工具面世时，许多开发者的第一反应是轻蔑的。
-“终端 AI 工具？GitHub 上一搜一大把，无非就是用 `readline` 读取用户输入，拼接一个 System Prompt，然后调用 OpenAI 或者 Anthropic 的接口，拿到回答后再 `console.log` 打印出来。要是高级一点，用 `child_process.exec` 执行一下系统命令而已，我自己周末花两天也能搓一个出来。”
+在前面五部分的架构解析之外，如果我们把目光聚焦到 Claude Code 是如何具体“跟大模型沟通”的，会发现许多绝妙的 Prompt 技巧和 Schema（参数结构）设计。这些是很多开发者在调用大模型 API 时最容易写得很糙的地方。
 
-然而，当你真正上手使用 Claude Code 后，这种轻视会被深深的震撼所取代。
-它可以在长达数个小时的 Debug 会话中始终保持极高的上下文敏感度而不“失忆”；
-它执行 `npm install` 报错时，会在终端画出一个极其丝滑的加载进度条，然后折叠起无关紧要的成功日志，高亮出那行真正的 Error；
-它修改你的代码时，会像 Git 界面一样在终端打出漂亮的红绿 Diff，甚至发现改错了还会主动撤销；
-最可怕的是，你可以随时按下 `Ctrl+Z` 把它挂起在后台，然后在前台新开一个会话让它去干别的，它居然能在终端里实现**多任务并发调度**。
+### 6.1 动态级联的 System Prompt (`src/utils/systemPrompt.ts`)
 
-这背后到底是怎样的黑科技？
+在大部分开源项目中，系统提示（System Prompt）就是一个写死在字符串里的几十行文字。但在 Claude Code 中，由于存在主副 Agent、多任务以及 MCP 插件扩展，它的 System Prompt 是一个**复杂的优先级拼装函数**（`buildEffectiveSystemPrompt`）：
 
-### 1.1 51万行 TypeScript 暴露的野心
+1. **绝对覆写 (Override)**：如果系统处于特殊循环模式，强行替换所有规则。
+2. **协调者模式 (Coordinator)**：如果是主管 Agent（不干活，只分配任务），它会被加载一套纯粹用于拆解任务的 Prompt。
+3. **主线程 Agent 叠加**：这非常巧妙。如果你使用 `AgentTool` 生成了一个专门写测试的子模型，系统的做法是：**保留基础生存规则**（比如怎么用工具、怎么认文件系统），但在最后追加一块 `\n# Custom Agent Instructions\n`，将子任务的设定（“你是一个专注的测试编写者”）贴上去。
+4. **伴生模型 (Buddy Prompt)**：甚至在 UI 旁边偶尔跳出来吐槽的吉祥物（Buddy），也有专门的一套极简 Prompt：*“你是一个小宠物，当用户没叫你时只准回一句话，不要解释你不是谁谁谁，不准喧宾夺主。”* (`src/buddy/prompt.ts`)
 
-通过从 NPM 发布的 `cli.js.map` 中提取完整的 `sourcesContent`，我们得到了一份几乎完整的业务代码快照。令人震惊的是：
-- **文件数量**：近 1900 个文件（不含 `node_modules`）
-- **代码规模**：超过 **510,000 行** TypeScript 和 TSX 代码。
-- **占比失衡**：真正用于发送 API 请求的代码可能不到 5%。其余 95% 的代码，全部被投入到了**终端 UI 渲染引擎、沙箱安全拦截、AST（抽象语法树）解析、状态机、多进程调度以及上下文记忆压缩**这些“脏活累活”中。
+**工程启示**：大型智能体的 Prompt 不应该是一个静态的大锅饭，而应该是像面向对象编程一样，有着基类（底层安全规则）和继承类（具体角色设定）的动态组装系统。
 
-Anthropic 根本不是在写一个脚本，他们是在 Node.js 和终端环境里，硬生生搓出了一个**微型操作系统**。这个系统的 CPU 是 Claude 大模型，而这 51 万行代码，就是包围在 CPU 外面的主板、内存控制器、显卡驱动和权限管理沙箱。
+### 6.2 骗过大模型的 "Sed 模拟器" (FileEditTool Schema 设计)
 
-### 1.2 启动链路的极客级优化：抢夺每一毫秒 (TTI)
+让大模型改代码，最怕的就是它把原文件清空，只写了一句 `// 其余代码省略...`。
 
-既然代码如此庞大，如何保证用户在终端敲下 `claude` 时能秒开？从 `src/entrypoints/cli.tsx` 到 `src/main.tsx`，我们看到了极度苛刻的性能优化（TTI, Time To Interactive）。
-
-**（1）极致的 Fast-Path 分流**
-终端工具必须快。如果用户只是敲一个 `claude --version`，去加载那 51 万行庞然大物简直是犯罪。
-因此，在最外层的 `cli.tsx` 中，系统会先进行极简的参数探测。一旦命中 `--version` 或特定的 `daemon` 后台唤醒指令，程序直接绕过主逻辑，打印内置的宏变量后 `process.exit(0)`。
-
-**（2）拦截器级别的初始化钩子**
-如果在主路径启动，它进入了 `src/main.tsx`。不同于普通的 CLI 顺序执行，Claude Code 使用 `@commander-js/extra-typings` 构建了命令树，并巧妙利用了 `.hook('preAction')` 钩子做**预加载**：
+如果你去查阅 `src/tools/FileEditTool/types.ts`，会发现 Anthropic 的工程师为了让模型能精准编辑，并没有让它输出完整的文件内容，也没有使用极其硬核、容易出错的 Git Patch 格式，而是发明了一套类似“查找并替换”的抽象：
 
 ```typescript
-// 源码级简化演示
-program.hook('preAction', async () => {
-    // 异步并行的极限压榨
-    await Promise.all([
-        ensureMdmSettingsLoaded(), // 从操作系统底层读企业 MDM 策略
-        ensureKeychainPrefetchCompleted(), // 去 macOS Keychain 预热取 OAuth Token
-        initBaseEnvironment() // 初始化 TLS 证书与安全代理
-    ]);
+// FileEditTool 期望模型输出的参数结构 (简化)
+inputSchema: {
+  file_path: "要改的文件绝对路径",
+  old_string: "要被替换掉的原代码段",
+  new_string: "要替换成的新代码段"
+}
+```
+
+但这带来了一个问题：大模型很难算准缩进。比如它提供的 `old_string` 开头少了两个空格，这个替换在严格匹配下就会失败。
+
+为了弥补大模型的“粗心”，在 `src/tools/FileEditTool/utils.ts` 中，系统实现了一个**智能对齐挂点（Smart Indent/Quote Matcher）**。当 `old_string` 无法在原文件中找到 100% 匹配时，系统会把它剥离空格、剥离换行甚至将单双引号模糊化，去寻找“实际上模型想要匹配的那段代码”，然后在替换时，强行套用原文件所在行的缩进量！
+
+**工程启示**：永远不要相信大模型输出格式的严格程度。优秀的 Agent 工具应该把 Schema 定义得对模型足够简单直观（用 `old` 换 `new`），然后把处理边界条件（缩进、引号混用）的“脏活”通过纯代码在本地兜底。
+
+### 6.3 BashTool 的极度克制：隐藏的内部 Schema
+
+上面我们在沙箱防御里提到，如果模型要执行高危操作，系统会要求人工审批。但在自动化测试场景下，如果不给它一些自主权，系统就没法往下跑。
+
+在 `src/tools/BashTool/BashTool.tsx` 中，我们看到了一个特别有意思的设计——**Schema 的两面派**：
+
+在这个工具真实的运行时结构里，其实隐藏了一些极其特殊的内部参数，比如 `_simulatedSedEdit` 或者是 `dangerouslyDisableSandbox`：
+
+```typescript
+const fullInputSchema = z.strictObject({
+  command: z.string().describe('The command to execute'),
+  timeout: z.number().optional(),
+  // 注意这段巨长的 Description，它在教模型怎么写描述词，甚至给出了具体例子
+  description: z.string().optional().describe(`Clear, concise description of what this command does in active voice. Never use words like "complex" or "risk"...
+For simple commands: ls → "List files"
+For commands harder to parse: curl -s url | jq → "Fetch JSON..."`),
+  
+  // 危险字段，内部机制使用，不对外暴露
+  dangerouslyDisableSandbox: z.boolean().optional(),
+  _simulatedSedEdit: z.object({...}).optional()
+});
+
+// 在传递给大模型时，它把这些后门参数全部 omit (剔除) 掉了！
+const inputSchema = fullInputSchema.omit({
+  _simulatedSedEdit: true,
+  dangerouslyDisableSandbox: true // 根据配置剔除
 });
 ```
-在界面还未出现的这几十毫秒里，系统已经把极度耗时的 IO 操作（读磁盘证书、读系统钥匙串、读企业注册表）全部丢到了 Node 的后台事件循环里去并行跑了。
 
-**（3）沙箱基座：薛定谔的环境变量**
-在进入真正的主界面前，`src/entrypoints/init.ts` 做了一件非常极客的事：**洗牌环境变量**。
-因为这套系统最终要代表大模型去执行本地 Shell，如果继承了用户宿主机的所有环境变量（比如带着恶意的 `LD_PRELOAD` 或者奇怪的 `NODE_OPTIONS`），它很容易被利用进行权限逃逸。
-因此，在初始化阶段，系统在内存中建立了一套“受限环境沙箱”。它剥离了那些可能导致任意代码执行的危险变量，只保留最干净的 `PATH`。只有当后面判定当前执行的命令绝对安全时，才会把原本的变量还给进程。
+**工程启示**：向大模型暴露的 Tool Schema，其实就是攻击面（Attack Surface）。对于内部状态流转需要的参数，绝对不能写进发给 API 的 Schema 里，否则聪明的大模型（甚至是被 Prompt 注入黑掉的模型）极有可能会发现这些后门参数，从而自己给自己开启“免沙箱权限”强行提权。
 
----
+### 6.4 终极外挂 MCP 协议：让模型自己发现“自己能干什么”
 
-## 第二部分：把终端当成浏览器写 —— 夸张的 React 渲染引擎
+在 `src/services/mcp/client.ts` 文件中，揭示了 Claude Code 为什么敢宣称能接入一切企业内部系统。
 
-让我们回到开头那个困惑：为什么 Claude Code 终端里的字能像网页一样局部刷新？为什么会有弹窗？
+Model Context Protocol (MCP) 是一个类似于 LSP（语言服务器协议）的东西，只不过它服务的是大模型。在这套代码里，它处理 MCP 接入的逻辑堪称典范：
 
-答案在 `src/components/` 和 `src/screens/` 这两个目录下，这里躺着近 400 个 `.tsx` 文件，占据了 10 万行代码。
+当 Claude Code 启动并连上你配置的本地/远端 MCP Server 后：
+1. 它并不会一口气把远端所有的 Tool 都注册给大模型（因为外部服务可能有上百个 API，全都塞进 Prompt 会导致 Token 爆炸）。
+2. 相反，系统注册了一个内置工具：`ListMcpResourcesTool`。
+3. 并在 System Prompt 里悄悄加上一句：“如果你找不到解决当前问题的内部工具，请尝试调用 `ListMcpResources` 看看有没有外部服务能帮你。”
+4. 大模型调用了这个 List 工具后，才发现：“哦！原来这里还有一个 Jira 接口！”
+5. 此时它才会进一步调用动态注册进来的特定 MCP Tool 去抓取工单信息。
 
-### 2.1 抛弃 Readline，拥抱 Virtual DOM
-在传统的 Node.js CLI 开发中，我们习惯于 `process.stdout.write`。但这只能一行行往下追加。如果上一行是一个不断转圈的 Spinner，下一行又要接收大模型的流式打字输出，传统方法会导致光标乱跳，界面全毁。
-
-Anthropic 选择了 **Ink** 框架（一个用 React 范式来写 CLI 终端的库），并对其底层，特别是针对 Facebook 的 **Yoga 布局引擎**（支持 Flexbox）进行了深度定制（代码见 `src/native-ts/yoga-layout/`）。
-
-这意味着：你在终端里看到的所有东西，其实是一个 **React 树**。
-- 顶部有一个 `<Header />` 栏。
-- 中间是一个 `<MessageList />` 滚动区域。
-- 底部悬浮着一个绝对定位的 `<InputPrompt />`。
-
-### 2.2 变态级的超级大管家：`REPL.tsx`
-整个 UI 交互的心脏是 `src/screens/REPL.tsx`，这是一个让人看一眼就会心生敬畏的 5000 行巨型组件。它是整个智能体操作系统的“桌面”。
-
-它没有把状态胡乱塞在组件内部，而是高度解耦，抽离出了几十个极其专业的 Hooks：
-```tsx
-// 从源码抽离出的核心 Hook 调用示例
-const { queue, isProcessing } = useCommandQueue() // 命令队列处理
-const { activeSession } = useRemoteSession() // 是否处于远程遥控模式
-const { pollInbox } = useMailboxBridge() // 监听其他后台 Agent 发来的消息
-const { checkIDEIntegration } = useIDEIntegration() // 检测 VSCode/Cursor 插件是否发来了文件高亮请求
-```
-
-当大模型在后台执行一个耗时 20 秒的 `npm run build` 时：
-1. 底层的 `BashTool` 持续将 stderr / stdout 输出到全局的 `AppStateStore`。
-2. 全局 Store 触发订阅，通知 `REPL.tsx` 里的 `<BashModeProgress />` 组件状态变更。
-3. React 触发重绘（Re-render），计算出当前组件树与上一帧组件树的 Diff。
-4. Ink 引擎将这个 Diff 转换为终端里的 ANSI 控制码（比如将光标上移 3 行，擦除那里的字符，画上一个新的进度条块）。
-
-这种极度奢侈的“前端化”终端实现，让 Claude Code 拥有了降维打击般的交互体验。它不仅能展示静态文本，它甚至实现了**平滑折叠动画**。当你看到它结束思考时，那个巨大的思考框会在几百毫秒内像被折叠一样收起，而不是生硬地刷屏消失。
+**工程启示**：动态能力发现（Capability Discovery）。这是实现通用高阶智能体的终极方向。不预先加载所有能力，而是给模型一个“发现能力的工具”，让它自己去“翻抽屉找工具”，既解决了上下文溢出问题，又实现了系统能力的无限横向扩展。
 
 ---
 
-## 第三部分：核心大脑 —— queryLoop 与四层极限记忆压缩系统
+## 最后的终章
 
-市面上许多号称能“自动接管终端”的开源 AI 工具，往往在经历 10 轮以上的复杂 Debug 后就会报错崩溃，原因是：把所有的命令行输出原封不动地塞给大模型，导致 Token 上限被瞬间撑爆。
+通过这 51 万行代码的逆向旅程，这六个部分的剖析已经将 Claude Code 从皮到骨扒得干干净净。
+它用极其雄厚的代码量，向整个业界证明了一个残酷的事实：**在 2025 年往后的 AI 应用开发中，调用大模型 API 的那几行代码早就不值钱了。**
 
-Anthropic 的工程师深知：**真实的工程环境里，噪声远大于信号。**
-在 `src/query.ts` 中，我们看到了整个系统的真正大脑 —— `queryLoop`（查询循环）。它不仅负责向 API 发送请求，更负责对历史记忆进行极其残暴且精准的“外科手术式压缩”。
+真正的壁垒，在于：
+- 你如何用极其复杂的本地逻辑（如 Bash AST）去填补大模型在执行力上的缺陷与危险；
+- 你如何用极致的终端 UI 渲染引擎去抚平大模型等待时间所带来的用户焦虑；
+- 你如何用层层叠叠的缓存与摘要算法（Microcompact/Autocompact）去对抗大模型的“失忆症”。
 
-### 3.1 什么是 queryLoop？
-你可以把它理解为一个小型的虚拟机事件循环（Event Loop）。
-当你输入一段话后，它进入 `while (true)` 死循环。在这个循环里，它向 Claude 3.7 发送上下文。如果 Claude 返回了“工具调用（Tool Use）”，它就在本地执行该工具，拿着结果重新进入下一轮循环。直到 Claude 说出人类语言，循环才会 `break` 结束。
-
-但在这段死循环里，隐藏着被称为 **四层记忆压缩（Context Collapse）** 的核心机密代码。
-
-### 3.2 第一层防线：Tool Result Budget（工具结果预算控制）
-
-这是应对类似 `cat package-lock.json` 或 `npm install` 输出海量日志的最前线。
-源码在 `src/query.ts` 中的 `applyToolResultBudget` 函数实现了这个逻辑。
-
-1. **设定阈值**：系统对每一种工具的输出设定了一个硬性的 Token / 字符数阈值（比如 Bash 的标准错误流上限为 4000 个字符）。
-2. **切片保留首尾**：当检测到某次 Bash 执行产生了 5 万字的滚屏报错时，算法会截取报错的前 1000 字（通常包含命令本身和初始化错误）和最后 3000 字（通常包含最终的 Stack Trace）。
-3. **静默文件缓存**：中间被腰斩的 4 万多字怎么办？系统并没有直接丢掉！它悄悄把完整的日志写入到 `~/.claude/` 目录下的一个临时上下文文件中。
-4. **注入提示引导语**：最后，在发给大模型的消息里，它会在被腰斩的地方强行插入一句类似的话：*(“中间大量输出已被截断以节约空间。如果上述截断内容不足以排查问题，请使用 FileReadTool 读取本地缓存文件 /var/folders/.../xxx.log 获取完整内容。”)*
-
-通过这第一层防线，大模型即使跑出了核弹级的日志，也不会被撑死，同时它还被赋予了“去指定地点看完整监控”的自主权。
-
-### 3.3 第二层防线：Snip Compact（精确剪枝）
-
-除了工具输出，模型自身在之前轮次中的“思考过程（Thinking Block）”也是极其消耗 Token 的。
-在 `src/query.ts` 的 `snipCompact` 阶段，系统会遍历历史消息。针对那些距离当前上下文已经比较遥远的回合，系统会直接将其思考过程（`<thinking>...</thinking>`）或者生成的一些无意义的确认回复（比如“好的，我已经看到了代码，现在我来用另一个工具”）整体“剪枝（Snip）”掉。
-对于模型而言，它只需要知道自己“曾经调用过什么工具，拿到了什么结果”，至于当时的心理活动，没必要在几十个回合后依然占用宝贵的提示词空间。
-
-### 3.4 第三层防线：Microcompact（微观塌缩）
-
-这也是一个非常天才的设计。
-有时候，大模型使用 `ls` 列出了一个目录里的 100 个文件，或者用 `grep` 搜出了几十处代码。这在当时是有用的，但三轮对话过后，这些中间产物完全成了垃圾。
-
-`microcompact` 算法会去寻找那些**长文本且未被后续强烈引用的历史 Tool Result**。
-一旦发现，它会将这段庞大的返回值直接抹除，替换为一个微型占位符（Tombstone）：
-*“[此处的内容已被系统为了优化上下文而折叠。]”*
-通过这种微观塌缩，系统能把前面累积的十几万无用 Token 瞬间释放，让大模型的注意力机制（Attention）死死盯在当前正在解决的 Bug 上，彻底根除了“越聊越笨”的通病。
-
-### 3.5 第四层防线：Autocompact（宏观总结归档）
-
-如果前三招都用尽了，面对那种聊了一整天的马拉松级会话，快要顶到模型的绝对物理极限怎么办？
-`Autocompact` 机制被迫出马。
-当系统检测到整体上下文 Token 即将触及危险红线时，它会在后台**临时唤醒一个轻量级模型（比如 Claude 3.5 Haiku）**，把最古老的那几十轮对话喂给它，命令它：“请将这段漫长的人机交互过程、踩过的坑、以及最终得出的系统状态，浓缩成一段 500 字的精简摘要。”
-随后，主进程将那几十轮原始对话硬生生截断删除，替换成这 500 字的摘要。
-就像人脑一样，对于很久以前的事情，我们不再记得每一句原话，只保留核心的知识（Semantic Memory）。这让 Claude Code 具备了理论上“无限长度”的会话续航能力。
-
----
-
-## 第四部分：不要把枪交给婴儿 —— 令人发指的安全与沙箱防线
-
-在任何终端 Agent 中，**权限管理**都是最让人头疼的问题。你既希望它全自动帮你把代码改好、把依赖装好、把 Git 推上去；你又怕它脑子一抽，直接 `rm -rf /`，或者偷偷把你的 `~/.ssh/id_rsa` 读出来发给不认识的 IP。
-
-Anthropic 为此付出了代码库中最为庞大的子系统：位于 `src/utils/bash` 和 `src/utils/permissions` 下的**近 3.3 万行安全防御代码**。
-
-### 4.1 自动模式 (Auto Mode) 并非真金白银的“随意开火”
-当你信任它，敲下 `/auto` 开启自动模式时，你以为它从此就可以绕过一切确认疯狂执行 Shell 了吗？错了。
-`ToolPermissionContext` 依然在暗中监视着一切。在 `permissionSetup.ts` 中，哪怕在最高信任级别下，系统依然会过滤掉那些**极端危险且缺乏确定性**的操作。
-
-### 4.2 惊为天人的本地 Bash AST 解析器
-它是如何判断一条 Shell 是不是危险的？
-绝大多数开源工具的做法是正则匹配：`if (cmd.includes('rm ') || cmd.includes('sudo')) return false;`
-这种防御在黑客面前如同纸糊，大模型甚至可能自己都不知道自己写出了绕过的代码，比如 `eval $(cat /tmp/script)`。
-
-Claude Code 没有偷懒，它在本地构建了一套（或深度移植了）**Bash 抽象语法树（AST）解析引擎**。
-当模型在 `BashTool` 中输出一条命令，例如：
-`find src -name "*.ts" | xargs cat | grep "password" > /tmp/out.txt &`
-
-在真正交给宿主机的 `child_process` 之前，这套引擎会立刻在内存中将这串字符大卸八块：
-1. **Pipeline 解析**：它认出了这里有三个命令，通过管道符 `|` 连接。
-2. **Command 白名单比对**：它依次检查 `find`（安全、只读）、`xargs`（中性，取决于后续参数）、`cat`（安全、只读）、`grep`（安全、只读）。
-3. **重定向检测**：敏锐地捕捉到了 `> /tmp/out.txt`。此时它立刻拉响警报：**“这是一个具有磁盘写入副作用（Write/Destructive）的操作！”**
-4. **后台符检测**：它发现了末尾的 `&`，这表明这是一个不等待返回的后台任务。
-
-综合评判后，这行命令被贴上了 `isDestructive = true` 的死神标签。
-
-### 4.3 UI 层的震慑与降级拦截
-一旦标签打上，无论模型怎么狡辩，这条命令在流转到 `BashTool.tsx` 准备执行时，就会被死死按住。
-终端 UI 引擎会立刻停止当前那平滑的打印动画，屏幕上会刷出一抹刺眼的警告色（利用 Ink 引擎的 `Color` 组件）。
-系统会在终端打印：*“系统检测到可能修改外部环境的破坏性命令，自动模式已拦截，请人类确认 [Y/n]？”*
-
-更夸张的是，这套解析器甚至能防住针对它自身的“毒化攻击”。如果你在项目中放了一个恶意的脚本试图篡改 `.claude/settings.json`，它的文件读写校验（Path Validation）会直接剥夺模型对自身配置目录的写入权限，实现物理隔离（隔离逻辑位于 `src/utils/sandbox/sandbox-adapter.ts`）。
-
----
-
-## 第五部分：源码级 Case Study —— 修复 Bug 的奇幻漂流
-
-纸上得来终觉浅，让我们把上面提到的所有底层架构串联起来。
-假设你在终端敲下了这句话：
-> *“我的项目中有一个叫做 `Header` 的组件，它在移动端对齐有问题，帮我修一下。”*
-
-当你敲下回车键的那一瞬间，这 51 万行代码是如何像精密的齿轮一样咬合运转的？
-
-### 5.1 捕获与路由
-请求首先到达了 `src/utils/handlePromptSubmit.ts`。
-1. **指令分类**：解析器首先检查这不是内置的系统指令（比如不是 `/help`，也不是 `/clear`）。
-2. **富文本注入**：如果在提交时，你向终端里拖拽了一张截图，`handlePromptSubmit` 会调用底层的图像处理库（存在于 `vendor/image-processor-src`），将图片压缩并转为 Base64，与你的文本合并为一个多模态消息 (Multimodal Message)。
-
-### 5.2 第一次请求：寻找目标
-系统打包好当前的系统环境（OS版本、当前路径等），并挂载上所有的 Tool Schemas，通过 `QueryEngine` 发送给 Claude 3.7 API。
-Claude 思考后回复：*“收到，我需要先找到 Header 组件的具体路径。”*
-它返回了一个 JSON 格式的 `tool_use`，请求调用 `GlobTool`，参数为 `pattern: "**/*Header*.tsx"`。
-
-### 5.3 并发执行与上下文注入
-`StreamingToolExecutor`（流式工具执行器）截获了这个请求。
-由于 `GlobTool` 是纯只读工具，权限模块秒批通过。系统通过定制的、基于 Rust 的文件搜索底层（类似 Ripgrep）瞬间秒出结果，定位到了 `src/components/Header/Header.tsx`。
-系统将这个结果打包成 `tool_result`，再发回给 Claude。
-
-### 5.4 第二次请求：读取文件
-Claude 这次调用了 `FileReadTool`。
-同样是秒批。由于系统在底层对文件 IO 做了缓存 (`readEditContext` 机制)，如果文件过大，系统只会把前面的一部分读进 Token 里。
-此时终端的 UI 会在之前的思考气泡下方，再渲染出一行灰色的文字：“*FileReadTool 执行成功，读取 Header.tsx*”。
-
-### 5.5 第三次请求：内存中的虚幻剪辑手（FileEditTool）
-重点来了，Claude 分析出了问题所在，它决定修改 `Header.tsx`。它调用了 `FileEditTool`，传回了它想修改的 `old_string` 和 `new_string`。
-在很多简单的 AI 编程工具中，直接调用 Node 的 `fs.writeFile` 就完事了。但在这里，为了保证代码格式不被毁坏：
-1. **试运行与对齐**：`FileEditTool.tsx` 首先会在内存里加载原文件，进行 `old_string` 的精确定位。如果发现 Claude 传回来的缩进和原文件不匹配（比如空格混了 Tab），系统底层有一个基于文本差异对齐的探针去进行智能修复。
-2. **Diff 渲染**：修改在内存中生效后，React 终端引擎里的 `<FileEditToolDiff />` 瞬间启动。由于你不在 Auto 模式，系统把终端界面一分为二，左边标红显示老代码，右边标绿显示新代码。
-3. **人类授权**：此时挂起 `queryLoop` 进程，弹出一个 `<TrustDialog>`：“是否应用此修改？[Y/n]”。你按下 `Y`，内存修改才正式通过 `fs.writeFileSync` 落盘。
-
-### 5.6 闭环：系统自检的执念
-修改落盘，任务结束了吗？还没有！
-由于在系统级 System Prompt 中，Anthropic 注入了一条死命令：**“修改代码后，必须尽你所能验证修改没有打破原有的项目构建。”**
-于是 Claude 紧接着调用了 `BashTool`，执行了 `npm run lint` 和 `npm run build`。
-如果执行出错了，底层强大的 Bash AST 解析器会把红色的报错信息抓回来，截断超长废话后喂给 Claude。
-Claude 发现自己改出了一个 TypeScript 语法错误，它会“主动”再次调用 `FileEditTool` 去修补自己刚刚挖的坑。
-直到 `npm run build` 终于打印出了绿色的 `Success`。
-Claude 终于向 `queryLoop` 返回了最终的文本结论：“修改完成并已通过本地类型检查。”，此时，终端的转圈动画停止，一切归于平静。
-
----
-
-## 结语：这不仅是一个产品，更是一本教科书
-
-阅读完这 51 万行代码，我最大的感受是：我们距离 AGI（通用人工智能）可能确实还有段距离，但我们距离 **“工业级 AI 生产力工具”** 已经近在咫尺。
-
-Claude Code 告诉我们，大模型只是一个强劲的发动机。要把发动机变成跑车：
-- 你需要 **Terminal UI** 去做仪表盘，给用户掌控感。
-- 你需要 **Tool Result Budget** 和四层压缩系统去做变速箱，保证它不会跑偏和爆缸。
-- 你需要 **Bash AST 沙箱** 做刹车系统，确保它不会把车开下悬崖。
-
-这套从 `cli.js.map` 还原出来的 1900 个文件，堪称当前时代开发高阶复杂 AI Agent 的绝佳教科书。它展示了目前在 Node.js 生态下，如何围绕大模型建立起一套严丝合缝、容错率极高的**工程化护城河**。
+与其说 Claude Code 是一个 AI 产品，不如说它是一套“**如何驯服、压榨、保护并伪装大语言模型**”的工业级工程模板。对于每一个想在 AI Agent 赛道上创业的开发者来说，这套源码，就是一座金矿。
