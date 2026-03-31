@@ -32,14 +32,10 @@
    - 全局文件数量与超大模块占比分析。
    - 为什么 Claude Code 用起来那么爽？揭秘其极限上下文截断、终端渲染引擎与多任务架构等工程亮点。
 
-## 深度长文解析系列 (万字长文揭秘)
+## 深度长文解析系列
 
-- [揭秘 Claude Code：从 51 万行源码看终端 Agent 的工程化极限（上）](./docs/08_deep_dive_architecture_part1.md)
-  - 宏观架构设计与四大核心支柱。
-- [揭秘 Claude Code：从 51 万行源码看终端 Agent 的工程化极限（中）](./docs/09_deep_dive_architecture_part2.md)
-  - 解析三大痛点解决方案：沙箱控制、上下文压缩技术与 React 终端 UI。
-- [揭秘 Claude Code：从 51 万行源码看终端 Agent 的工程化极限（下）](./docs/10_deep_dive_architecture_part3.md)
-  - 真实 Case 追踪：“修改组件Bug”时的代码调用链，以及 MCP 协议大一统的前瞻。
+- [【万字长文】揭秘 Claude Code：从 51 万行源码看大模型终端 Agent 的工程化极限](./docs/epic_deep_dive_full.md)
+  - 核心包含：系统启动的毫秒级极客优化、媲美浏览器的 React 终端引擎、解决大模型失忆的四层记忆压缩系统、令人发指的 Bash AST 沙箱防御，以及最后带你穿行代码走查一个真实 Bug 的修复全流程。
 
 ## 核心设计理念速览
 
