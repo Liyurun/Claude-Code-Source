@@ -28,6 +28,10 @@
    - MCP（Model Context Protocol）客户端是如何被深度集成到系统并转化为可用 Tool 的。
    - 插件与技能系统的动态加载方案。
 
+6. **[代码库统计与体验优势深度解析](./docs/06_codebase_stats_and_insights.md)**
+   - 全局文件数量与超大模块占比分析。
+   - 为什么 Claude Code 用起来那么爽？揭秘其极限上下文截断、终端渲染引擎与多任务架构等工程亮点。
+
 ## 核心设计理念速览
 
 - **Agent Runtime**：它不是简单的 OpenAI wrapper，而是一个包含多任务调度、权限管控、本地沙箱验证、复杂长下文压缩的运行环境。
