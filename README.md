@@ -32,6 +32,15 @@
    - 全局文件数量与超大模块占比分析。
    - 为什么 Claude Code 用起来那么爽？揭秘其极限上下文截断、终端渲染引擎与多任务架构等工程亮点。
 
+## 深度长文解析系列 (万字长文揭秘)
+
+- [揭秘 Claude Code：从 51 万行源码看终端 Agent 的工程化极限（上）](./docs/08_deep_dive_architecture_part1.md)
+  - 宏观架构设计与四大核心支柱。
+- [揭秘 Claude Code：从 51 万行源码看终端 Agent 的工程化极限（中）](./docs/09_deep_dive_architecture_part2.md)
+  - 解析三大痛点解决方案：沙箱控制、上下文压缩技术与 React 终端 UI。
+- [揭秘 Claude Code：从 51 万行源码看终端 Agent 的工程化极限（下）](./docs/10_deep_dive_architecture_part3.md)
+  - 真实 Case 追踪：“修改组件Bug”时的代码调用链，以及 MCP 协议大一统的前瞻。
+
 ## 核心设计理念速览
 
 - **Agent Runtime**：它不是简单的 OpenAI wrapper，而是一个包含多任务调度、权限管控、本地沙箱验证、复杂长下文压缩的运行环境。
